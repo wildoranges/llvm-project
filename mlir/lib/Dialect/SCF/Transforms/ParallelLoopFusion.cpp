@@ -92,46 +92,6 @@ static bool equalIterationSpaces(ParallelOp firstPloop,
          matchOperands(firstPloop.getStep(), secondPloop.getStep());
 }
 
-/// Check if both operations are the same type of memory write op and
-/// write to the same memory location (same buffer and same indices).
-static bool opsWriteSameMemLocation(Operation *op1, Operation *op2) {
-  if (!op1 || !op2 || op1->getName() != op2->getName())
-    return false;
-  if (op1 == op2)
-    return true;
-  // support only these memory-writing ops for now
-  if (!isa<memref::StoreOp, vector::TransferWriteOp, vector::StoreOp>(op1))
-    return false;
-  bool opsAreIdentical =
-      llvm::TypeSwitch<Operation *, bool>(op1)
-          .Case([&](memref::StoreOp storeOp1) {
-            auto storeOp2 = cast<memref::StoreOp>(op2);
-            return (storeOp1.getMemRef() == storeOp2.getMemRef()) &&
-                   (storeOp1.getIndices() == storeOp2.getIndices());
-          })
-          .Case([&](vector::TransferWriteOp writeOp1) {
-            auto writeOp2 = cast<vector::TransferWriteOp>(op2);
-            return (writeOp1.getBase() == writeOp2.getBase()) &&
-                   (writeOp1.getIndices() == writeOp2.getIndices()) &&
-                   (writeOp1.getMask() == writeOp2.getMask()) &&
-                   (writeOp1.getValueToStore().getType() ==
-                    writeOp2.getValueToStore().getType()) &&
-                   (writeOp1.getInBounds() == writeOp2.getInBounds());
-          })
-          .Case([&](vector::StoreOp vecStoreOp1) {
-            auto vecStoreOp2 = cast<vector::StoreOp>(op2);
-            return (vecStoreOp1.getBase() == vecStoreOp2.getBase()) &&
-                   (vecStoreOp1.getIndices() == vecStoreOp2.getIndices()) &&
-                   (vecStoreOp1.getValueToStore().getType() ==
-                    vecStoreOp2.getValueToStore().getType()) &&
-                   (vecStoreOp1.getAlignment() == vecStoreOp2.getAlignment()) &&
-                   (vecStoreOp1.getNontemporal() ==
-                    vecStoreOp2.getNontemporal());
-          })
-          .Default([](Operation *) { return false; });
-  return opsAreIdentical;
-}
-
 /// Check if val1 (from the first parallel loop) and val2 (from the
 /// second) are equivalent, considering the mapping of induction variables from
 /// the first to the second parallel loop.
@@ -153,6 +113,56 @@ static bool valsAreEquivalent(Value val1, Value val2,
                        loopsIVsMap.lookupOrDefault(v2) == v1);
       },
       /*markEquivalent=*/nullptr, OperationEquivalence::Flags::IgnoreLocations);
+}
+
+/// Check if both operations are the same type of memory write op and
+/// write to the same memory location, accounting for the loop IV mapping.
+static bool opsWriteSameMemLocation(Operation *op1, Operation *op2,
+                                    const IRMapping &loopsIVsMap = {}) {
+  if (!op1 || !op2 || op1->getName() != op2->getName())
+    return false;
+  if (op1 == op2)
+    return true;
+  // support only these memory-writing ops for now
+  if (!isa<memref::StoreOp, vector::TransferWriteOp, vector::StoreOp>(op1))
+    return false;
+  auto sameIndices = [&](ValueRange lhs, ValueRange rhs) {
+    return llvm::equal(lhs, rhs, [&](Value a, Value b) {
+      return valsAreEquivalent(a, b, loopsIVsMap);
+    });
+  };
+  bool opsAreIdentical =
+      llvm::TypeSwitch<Operation *, bool>(op1)
+          .Case([&](memref::StoreOp storeOp1) {
+            auto storeOp2 = cast<memref::StoreOp>(op2);
+            return (storeOp1.getMemRef() == storeOp2.getMemRef()) &&
+                   sameIndices(storeOp1.getIndices(), storeOp2.getIndices());
+          })
+          .Case([&](vector::TransferWriteOp writeOp1) {
+            auto writeOp2 = cast<vector::TransferWriteOp>(op2);
+            return (writeOp1.getBase() == writeOp2.getBase()) &&
+                   sameIndices(writeOp1.getIndices(), writeOp2.getIndices()) &&
+                   (writeOp1.getMask() == writeOp2.getMask()) &&
+                   !writeOp1.isMasked() && !writeOp2.isMasked() &&
+                   (writeOp1.getPermutationMap() ==
+                    writeOp2.getPermutationMap()) &&
+                   (writeOp1.getValueToStore().getType() ==
+                    writeOp2.getValueToStore().getType()) &&
+                   (writeOp1.getInBounds() == writeOp2.getInBounds());
+          })
+          .Case([&](vector::StoreOp vecStoreOp1) {
+            auto vecStoreOp2 = cast<vector::StoreOp>(op2);
+            return (vecStoreOp1.getBase() == vecStoreOp2.getBase()) &&
+                   sameIndices(vecStoreOp1.getIndices(),
+                               vecStoreOp2.getIndices()) &&
+                   (vecStoreOp1.getValueToStore().getType() ==
+                    vecStoreOp2.getValueToStore().getType()) &&
+                   (vecStoreOp1.getAlignment() == vecStoreOp2.getAlignment()) &&
+                   (vecStoreOp1.getNontemporal() ==
+                    vecStoreOp2.getNontemporal());
+          })
+          .Default([](Operation *) { return false; });
+  return opsAreIdentical;
 }
 
 /// If the `expr` value is the result of an integer addition of `base` and a
@@ -627,6 +637,8 @@ static bool haveNoDataDependenciesExceptSameIndex(
   llvm::SmallSetVector<Value, 4> buffersWrittenInFirstPloop;
 
   auto collectStoreOpsInWalk = [&](Operation *op) {
+    if (hasUnknownEffects(op))
+      return WalkResult::interrupt();
     auto memOpInterf = dyn_cast_if_present<MemoryEffectOpInterface>(op);
     // Ignore ops that don't write to memory
     if (!memOpInterf || (!memOpInterf.hasEffect<MemoryEffects::Write>() &&
@@ -655,47 +667,40 @@ static bool haveNoDataDependenciesExceptSameIndex(
   if (firstPloop.getBody()->walk(collectStoreOpsInWalk).wasInterrupted())
     return false;
 
-  // Check that this load/read op encountered while walking the second parallel
+  // Check that this read/write op encountered while walking the second parallel
   // loop does not have incompatible data dependencies with the store/write ops
   // collected from the first parallel loop: the loops can be fused only if in
   // the 2nd loop there are no loads/stores from/to the buffers written in the
   // 1st loop, except when on the same exact memory location (same indices) as
   // written in the 1st loop.
-  auto checkLoadInWalkHasNoIncompatibleDataDeps = [&](Operation *loadOp) {
-    auto memOpInterf = dyn_cast_if_present<MemoryEffectOpInterface>(loadOp);
-    // To be conservative, we should stop on ops that don't advertise their
-    // memory effects. However, many ops don't implement MemoryEffectOpInterface
-    // yet, so for now we just skip them.
-    // TODO: once more ops add MemoryEffectOpInterface, interrupt the walk here.
-    if (!memOpInterf &&
-        !loadOp->hasTrait<mlir::OpTrait::HasRecursiveMemoryEffects>())
-      return WalkResult::advance();
-    // Ignore ops that don't read from memory, and wrapping ops that have nested
-    // memory effects (e.g. loops, conditionals) as they will be analyzed when
-    // visiting their nested ops.
-    if ((!memOpInterf &&
-         loadOp->hasTrait<mlir::OpTrait::HasRecursiveMemoryEffects>()) ||
-        (memOpInterf && !memOpInterf.hasEffect<MemoryEffects::Read>()))
-      return WalkResult::advance();
-    // Support only these memory-reading ops for now
-    if (!isa<memref::LoadOp, vector::TransferReadOp, vector::LoadOp>(loadOp) ||
-        !isa<MemrefValue>(loadOp->getOperand(0)))
+  auto checkAccessInWalkHasNoIncompatibleDataDeps = [&](Operation *accessOp) {
+    auto memOpInterf = dyn_cast_if_present<MemoryEffectOpInterface>(accessOp);
+    if (hasUnknownEffects(accessOp))
       return WalkResult::interrupt();
+    // Nested effects are checked by the walk. Ignore ops that neither read nor
+    // write memory themselves.
+    if (!memOpInterf || (!memOpInterf.hasEffect<MemoryEffects::Read>() &&
+                         !memOpInterf.hasEffect<MemoryEffects::Write>()))
+      return WalkResult::advance();
 
-    MemrefValue loadOpBase = cast<MemrefValue>(loadOp->getOperand(0));
-    MemrefValue loadedOrigBuf = memref::skipFullyAliasingOperations(loadOpBase);
+    auto accessOpBase = dyn_cast_or_null<MemrefValue>(getBaseMemref(accessOp));
+    if (!accessOpBase)
+      return WalkResult::interrupt();
+    MemrefValue accessedOrigBuf =
+        memref::skipFullyAliasingOperations(accessOpBase);
 
     for (Value storedMem : buffersWrittenInFirstPloop)
-      if ((storedMem != loadedOrigBuf) && mayAlias(storedMem, loadedOrigBuf) &&
+      if ((storedMem != accessedOrigBuf) &&
+          mayAlias(storedMem, accessedOrigBuf) &&
           !llvm::all_of(bufferStoresInFirstPloop[storedMem],
                         [&](Operation *storeOp) {
-                          return canResolveAlias(loadOp, storeOp,
+                          return canResolveAlias(accessOp, storeOp,
                                                  firstToSecondPloopIndices);
                         })) {
         return WalkResult::interrupt();
       }
 
-    auto writeOpsIt = bufferStoresInFirstPloop.find(loadedOrigBuf);
+    auto writeOpsIt = bufferStoresInFirstPloop.find(accessedOrigBuf);
     if (writeOpsIt == bufferStoresInFirstPloop.end())
       return WalkResult::advance();
     // Store/write ops to this buffer in the firstPloop
@@ -715,25 +720,29 @@ static bool haveNoDataDependenciesExceptSameIndex(
       return WalkResult::interrupt();
     }
 
-    // Check that the load in secondPloop reads from the same memory location as
-    // written by the corresponding store in firstPloop
-    if (!loadsFromSameMemoryLocationWrittenBy(loadOp, writeOp,
-                                              firstToSecondPloopIndices, b)) {
+    // Writes must also match the corresponding iteration's location: matching
+    // only reads misses write-after-write dependencies between iterations.
+    if (memOpInterf.hasEffect<MemoryEffects::Write>()) {
+      if (!opsWriteSameMemLocation(writeOp, accessOp,
+                                   firstToSecondPloopIndices))
+        return WalkResult::interrupt();
+    } else if (!loadsFromSameMemoryLocationWrittenBy(
+                   accessOp, writeOp, firstToSecondPloopIndices, b)) {
       return WalkResult::interrupt();
     }
 
     return WalkResult::advance();
   };
 
-  // Walk the second parallel loop to check load/read ops against the stores
+  // Walk the second parallel loop to check read/write ops against the stores
   // collected from the first parallel loop.
   return !secondPloop.getBody()
-              ->walk(checkLoadInWalkHasNoIncompatibleDataDeps)
+              ->walk(checkAccessInWalkHasNoIncompatibleDataDeps)
               .wasInterrupted();
 }
 
-/// Check that in each loop there are no read ops on the buffers written
-/// by the other loop, except when reading from the same exact memory location
+/// Check that in each loop there are no read/write ops on the buffers written
+/// by the other loop, except when accessing the same exact memory location
 /// (same indices) as written in the other loop.
 static bool
 noIncompatibleDataDependencies(ParallelOp firstPloop, ParallelOp secondPloop,

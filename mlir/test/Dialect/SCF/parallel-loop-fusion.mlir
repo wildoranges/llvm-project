@@ -787,6 +787,7 @@ func.func @do_not_fuse_vector_transfer_different_indices(%A: memref<4x4xf32>) {
 // -----
 
 func.func @fuse_vector_transfer_with_subview(%A: memref<1x4xf32>) {
+  %out = memref.alloca() : memref<1x4xf32>
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c4 = arith.constant 4 : index
@@ -803,7 +804,7 @@ func.func @fuse_vector_transfer_with_subview(%A: memref<1x4xf32>) {
       %n = arith.addf %v, %acc : f32
       scf.yield %n : f32
     }
-    memref.store %sum, %A[%c0, %c0] : memref<1x4xf32>
+    memref.store %sum, %out[%c0, %c0] : memref<1x4xf32>
     scf.reduce
   }
   return
@@ -811,6 +812,7 @@ func.func @fuse_vector_transfer_with_subview(%A: memref<1x4xf32>) {
 // CHECK-LABEL: func @fuse_vector_transfer_with_subview
 // CHECK:       scf.parallel
 // CHECK:         vector.transfer_write
+// CHECK-NOT:   scf.parallel
 // CHECK:         scf.for
 // CHECK-NOT:   scf.parallel
 
@@ -937,7 +939,7 @@ func.func @do_not_fuse_vector_transfer_write_in_vector_mask(%A: memref<8xf32>, %
 
 // -----
 
-func.func @fuse_vector_transfer_subview_rank_reducing(%A: memref<1x4xf32>, %B: memref<1x4xf32>) {
+func.func @fuse_vector_transfer_subview_rank_reducing(%A: memref<1x4xf32>) -> f32 {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c4 = arith.constant 4 : index
@@ -948,20 +950,24 @@ func.func @fuse_vector_transfer_subview_rank_reducing(%A: memref<1x4xf32>, %B: m
     vector.transfer_write %vec, %sub[%c0] {permutation_map = affine_map<(d0) -> (d0)>, in_bounds = [true]} : vector<4xf32>, memref<4xf32, strided<[1], offset: ?>>
     scf.reduce
   }
-  scf.parallel (%i) = (%c0) to (%c1) step (%c1) {
+  %result = scf.parallel (%i) = (%c0) to (%c1) step (%c1) init (%zero) -> f32 {
     %sum = scf.for %k = %c0 to %c4 step %c1 iter_args(%acc = %zero) -> f32 {
       %v = memref.load %A[%i, %k] : memref<1x4xf32>
       %n = arith.addf %v, %acc : f32
       scf.yield %n : f32
     }
-    memref.store %sum, %B[%i, %c0] : memref<1x4xf32>
-    scf.reduce
+    scf.reduce(%sum : f32) {
+    ^bb0(%lhs: f32, %rhs: f32):
+      %add = arith.addf %lhs, %rhs : f32
+      scf.reduce.return %add : f32
+    }
   }
-  return
+  return %result : f32
 }
 // CHECK-LABEL: func @fuse_vector_transfer_subview_rank_reducing
 // CHECK:       scf.parallel
 // CHECK:         vector.transfer_write
+// CHECK-NOT:   scf.parallel
 // CHECK:         scf.for
 // CHECK-NOT:   scf.parallel
 
@@ -999,7 +1005,8 @@ func.func @do_not_fuse_vector_transfer_subview_offset(%A: memref<1x4xf32>, %B: m
 
 // -----
 
-func.func @fuse_vector_transfer_no_subview(%A: memref<1x4xf32>, %B: memref<1x4xf32>) {
+func.func @fuse_vector_transfer_no_subview(%A: memref<1x4xf32>) {
+  %B = memref.alloca() : memref<1x4xf32>
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c4 = arith.constant 4 : index
@@ -1022,12 +1029,14 @@ func.func @fuse_vector_transfer_no_subview(%A: memref<1x4xf32>, %B: memref<1x4xf
 }
 // CHECK-LABEL: func @fuse_vector_transfer_no_subview
 // CHECK:       vector.transfer_write
+// CHECK-NOT:   scf.parallel
 // CHECK:       scf.for
 // CHECK-NOT:   scf.parallel
 
 // -----
 
-func.func @fuse_vector_transfer_scalar_load_rank2(%A: memref<2x4xf32>, %B: memref<2x4xf32>) {
+func.func @fuse_vector_transfer_scalar_load_rank2(%A: memref<2x4xf32>) {
+  %B = memref.alloca() : memref<2x4xf32>
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c2 = arith.constant 2 : index
@@ -1048,13 +1057,15 @@ func.func @fuse_vector_transfer_scalar_load_rank2(%A: memref<2x4xf32>, %B: memre
 // CHECK-LABEL: func @fuse_vector_transfer_scalar_load_rank2
 // CHECK:       scf.parallel
 // CHECK:         vector.transfer_write
+// CHECK-NOT:   scf.parallel
 // CHECK:         memref.load
 // CHECK:         memref.load
 // CHECK-NOT:   scf.parallel
 
 // -----
 
-func.func @fuse_vector_transfer_scalar_load_loop_rank2(%A: memref<2x4xf32>, %B: memref<2x4xf32>) {
+func.func @fuse_vector_transfer_scalar_load_loop_rank2(%A: memref<2x4xf32>) {
+  %B = memref.alloca() : memref<2x4xf32>
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c4 = arith.constant 4 : index
@@ -1078,6 +1089,7 @@ func.func @fuse_vector_transfer_scalar_load_loop_rank2(%A: memref<2x4xf32>, %B: 
 // CHECK-LABEL: func @fuse_vector_transfer_scalar_load_loop_rank2
 // CHECK:       scf.parallel
 // CHECK:         vector.transfer_write
+// CHECK-NOT:   scf.parallel
 // CHECK:         scf.for
 // CHECK-NOT:   scf.parallel
 
@@ -1135,7 +1147,8 @@ func.func @do_not_fuse_vector_transfer_scalar_load_write_in_vector_mask(%A: memr
 
 // -----
 
-func.func @fuse_vector_store_scalar_load_rank2(%A: memref<2x4xf32>, %B: memref<2x4xf32>) {
+func.func @fuse_vector_store_scalar_load_rank2(%A: memref<2x4xf32>) {
+  %B = memref.alloca() : memref<2x4xf32>
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c2 = arith.constant 2 : index
@@ -1157,6 +1170,7 @@ func.func @fuse_vector_store_scalar_load_rank2(%A: memref<2x4xf32>, %B: memref<2
 // CHECK-LABEL: func @fuse_vector_store_scalar_load_rank2
 // CHECK:       scf.parallel
 // CHECK:         vector.store
+// CHECK-NOT:   scf.parallel
 // CHECK:         memref.load
 // CHECK:         memref.load
 // CHECK-NOT:   scf.parallel
@@ -1798,7 +1812,8 @@ func.func @fuse_chain_after_interchanged_reduction(
 // Bounds that are equal constants describe the same iteration space even when
 // they are materialized by distinct `arith.constant` ops, so the loops fuse.
 
-func.func @fuse_equal_constant_bounds(%A: memref<16xf32>, %B: memref<16xf32>) {
+func.func @fuse_equal_constant_bounds(%A: memref<16xf32>) {
+  %B = memref.alloca() : memref<16xf32>
   %c0 = arith.constant 0 : index
   %c16 = arith.constant 16 : index
   %c1 = arith.constant 1 : index
@@ -1831,8 +1846,8 @@ func.func @fuse_equal_constant_bounds(%A: memref<16xf32>, %B: memref<16xf32>) {
 // Only some of the bounds need to be shared SSA values; the rest may be equal
 // constants defined separately.
 
-func.func @fuse_partially_shared_constant_bounds(%A: memref<4x4xf32>,
-                                                 %B: memref<4x4xf32>) {
+func.func @fuse_partially_shared_constant_bounds(%A: memref<4x4xf32>) {
+  %B = memref.alloca() : memref<4x4xf32>
   %c0 = arith.constant 0 : index
   %c4 = arith.constant 4 : index
   %c1 = arith.constant 1 : index
@@ -1946,3 +1961,314 @@ func.func @do_not_fuse_mixed_signedness() {
 // CHECK-LABEL: func @do_not_fuse_mixed_signedness
 // CHECK:        scf.parallel unsigned (
 // CHECK:        scf.parallel (
+
+// -----
+
+// Each original loop is race-free; fusion would make adjacent iterations race.
+// CHECK-LABEL: func.func @do_not_fuse_waw_shifted_indices(
+// CHECK: scf.parallel
+// CHECK: scf.parallel
+// CHECK-NOT: scf.parallel
+// CHECK: return
+func.func @do_not_fuse_waw_shifted_indices(%A: memref<5xi32>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %one = arith.constant 1 : i32
+  %two = arith.constant 2 : i32
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    memref.store %one, %A[%i] : memref<5xi32>
+    scf.reduce
+  }
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    %j = arith.addi %i, %c1 : index
+    memref.store %two, %A[%j] : memref<5xi32>
+    scf.reduce
+  }
+  return
+}
+
+// -----
+
+// CHECK-LABEL: func.func @fuse_waw_same_indices(
+// CHECK: scf.parallel
+// CHECK-NOT: scf.parallel
+// CHECK: return
+func.func @fuse_waw_same_indices(%A: memref<5xi32>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %one = arith.constant 1 : i32
+  %two = arith.constant 2 : i32
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    memref.store %one, %A[%i] : memref<5xi32>
+    scf.reduce
+  }
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    memref.store %two, %A[%i] : memref<5xi32>
+    scf.reduce
+  }
+  return
+}
+
+// -----
+
+// The arguments may be overlapping views, even though their indices match.
+// CHECK-LABEL: func.func @do_not_fuse_waw_aliasing_buffers(
+// CHECK: scf.parallel
+// CHECK: scf.parallel
+// CHECK-NOT: scf.parallel
+// CHECK: return
+func.func @do_not_fuse_waw_aliasing_buffers(%A: memref<5xi32>, %B: memref<5xi32>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %one = arith.constant 1 : i32
+  %two = arith.constant 2 : i32
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    memref.store %one, %A[%i] : memref<5xi32>
+    scf.reduce
+  }
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    memref.store %two, %B[%i] : memref<5xi32>
+    scf.reduce
+  }
+  return
+}
+
+// -----
+
+// CHECK-LABEL: func.func @fuse_waw_disjoint_buffers(
+// CHECK: scf.parallel
+// CHECK-NOT: scf.parallel
+// CHECK: return
+func.func @fuse_waw_disjoint_buffers() {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %one = arith.constant 1 : i32
+  %two = arith.constant 2 : i32
+  %A = memref.alloca() : memref<5xi32>
+  %B = memref.alloca() : memref<5xi32>
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    memref.store %one, %A[%i] : memref<5xi32>
+    scf.reduce
+  }
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    memref.store %two, %B[%i] : memref<5xi32>
+    scf.reduce
+  }
+  return
+}
+
+// -----
+
+// CHECK-LABEL: func.func @do_not_fuse_waw_vector_store(
+// CHECK: scf.parallel
+// CHECK: scf.parallel
+// CHECK-NOT: scf.parallel
+// CHECK: return
+func.func @do_not_fuse_waw_vector_store(%A: memref<5x4xf32>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %v = arith.constant dense<1.0> : vector<4xf32>
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    vector.store %v, %A[%i, %c0] : memref<5x4xf32>, vector<4xf32>
+    scf.reduce
+  }
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    %j = arith.addi %i, %c1 : index
+    vector.store %v, %A[%j, %c0] : memref<5x4xf32>, vector<4xf32>
+    scf.reduce
+  }
+  return
+}
+
+// -----
+
+// Different iterations write distinct columns in the first loop and rows in the second.
+// CHECK-LABEL: func.func @do_not_fuse_waw_transfer_permutations(
+// CHECK: scf.parallel
+// CHECK: scf.parallel
+// CHECK-NOT: scf.parallel
+// CHECK: return
+func.func @do_not_fuse_waw_transfer_permutations(%A: memref<7x7xf32>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %v = arith.constant dense<1.0> : vector<4xf32>
+  %c3 = arith.constant 3 : index
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    %j = arith.subi %c3, %i : index
+    vector.transfer_write %v, %A[%i, %j] {permutation_map = affine_map<(d0, d1) -> (d0)>, in_bounds = [true]} : vector<4xf32>, memref<7x7xf32>
+    scf.reduce
+  }
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    %j = arith.subi %c3, %i : index
+    vector.transfer_write %v, %A[%i, %j] {permutation_map = affine_map<(d0, d1) -> (d1)>, in_bounds = [true]} : vector<4xf32>, memref<7x7xf32>
+    scf.reduce
+  }
+  return
+}
+
+// -----
+
+// The masks select A[i] and A[i + 1], respectively.
+// CHECK-LABEL: func.func @do_not_fuse_waw_transfer_masks(
+// CHECK: scf.parallel
+// CHECK: scf.parallel
+// CHECK-NOT: scf.parallel
+// CHECK: return
+func.func @do_not_fuse_waw_transfer_masks(%A: memref<5xf32>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %v = arith.constant dense<1.0> : vector<2xf32>
+  %left = arith.constant dense<[true, false]> : vector<2xi1>
+  %right = arith.constant dense<[false, true]> : vector<2xi1>
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    vector.transfer_write %v, %A[%i], %left {in_bounds = [true]} : vector<2xf32>, memref<5xf32>
+    scf.reduce
+  }
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    vector.transfer_write %v, %A[%i], %right {in_bounds = [true]} : vector<2xf32>, memref<5xf32>
+    scf.reduce
+  }
+  return
+}
+
+// -----
+
+// The masks select A[i] and A[i + 1], respectively.
+// CHECK-LABEL: func.func @do_not_fuse_waw_vector_mask(
+// CHECK: scf.parallel
+// CHECK: scf.parallel
+// CHECK-NOT: scf.parallel
+// CHECK: return
+func.func @do_not_fuse_waw_vector_mask(%A: memref<5xf32>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %v = arith.constant dense<1.0> : vector<2xf32>
+  %left = arith.constant dense<[true, false]> : vector<2xi1>
+  %right = arith.constant dense<[false, true]> : vector<2xi1>
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    vector.mask %left { vector.transfer_write %v, %A[%i] {in_bounds = [true]} : vector<2xf32>, memref<5xf32> } : vector<2xi1>
+    scf.reduce
+  }
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    vector.mask %right { vector.transfer_write %v, %A[%i] {in_bounds = [true]} : vector<2xf32>, memref<5xf32> } : vector<2xi1>
+    scf.reduce
+  }
+  return
+}
+
+// -----
+
+// CHECK-LABEL: func.func @do_not_fuse_unknown_effects_first(
+// CHECK: scf.parallel
+// CHECK: scf.parallel
+// CHECK-NOT: scf.parallel
+// CHECK: return
+func.func @do_not_fuse_unknown_effects_first(%A: memref<5xi32>, %B: memref<5xi32>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %one = arith.constant 1 : i32
+  %two = arith.constant 2 : i32
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    func.call @write_element(%A, %i) : (memref<5xi32>, index) -> ()
+    scf.reduce
+  }
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    %j = arith.subi %c4, %i : index
+    %v = memref.load %A[%j] : memref<5xi32>
+    memref.store %v, %B[%i] : memref<5xi32>
+    scf.reduce
+  }
+  return
+}
+
+func.func private @write_element(memref<5xi32>, index)
+
+// -----
+
+// CHECK-LABEL: func.func @do_not_fuse_unknown_effects_second(
+// CHECK: scf.parallel
+// CHECK: scf.parallel
+// CHECK-NOT: scf.parallel
+// CHECK: return
+func.func @do_not_fuse_unknown_effects_second(%A: memref<5xi32>, %B: memref<5xi32>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %one = arith.constant 1 : i32
+  %two = arith.constant 2 : i32
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    memref.store %one, %A[%i] : memref<5xi32>
+    scf.reduce
+  }
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    func.call @write_element(%A, %i) : (memref<5xi32>, index) -> ()
+    scf.reduce
+  }
+  return
+}
+
+func.func private @write_element(memref<5xi32>, index)
+
+// -----
+
+// CHECK-LABEL: func.func @do_not_fuse_unknown_effects_nested(
+// CHECK: scf.parallel
+// CHECK: scf.parallel
+// CHECK-NOT: scf.parallel
+// CHECK: return
+func.func @do_not_fuse_unknown_effects_nested(%A: memref<5xi32>, %B: memref<5xi32>, %cond: i1) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %one = arith.constant 1 : i32
+  %two = arith.constant 2 : i32
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    scf.if %cond {
+      func.call @write_element(%A, %i) : (memref<5xi32>, index) -> ()
+    }
+    scf.reduce
+  }
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    %j = arith.subi %c4, %i : index
+    %v = memref.load %A[%j] : memref<5xi32>
+    memref.store %v, %B[%i] : memref<5xi32>
+    scf.reduce
+  }
+  return
+}
+
+func.func private @write_element(memref<5xi32>, index)
+
+// -----
+
+// CHECK-LABEL: func.func @fuse_waw_recursive_effects(
+// CHECK: scf.parallel
+// CHECK-NOT: scf.parallel
+// CHECK: return
+func.func @fuse_waw_recursive_effects(%A: memref<5xi32>, %cond: i1) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %one = arith.constant 1 : i32
+  %two = arith.constant 2 : i32
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    scf.if %cond {
+      memref.store %one, %A[%i] : memref<5xi32>
+    }
+    scf.reduce
+  }
+  scf.parallel (%i) = (%c0) to (%c4) step (%c1) {
+    memref.store %two, %A[%i] : memref<5xi32>
+    scf.reduce
+  }
+  return
+}
